@@ -27,8 +27,9 @@ pub use std::{pin::Pin, sync::Arc, time::Duration};
 
 pub use anyhow::{Ok, Result};
 pub use bytes::Bytes;
+use tokio::sync::mpsc::channel;
 pub use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::{sync::mpsc::channel, task::JoinHandle};
+pub use tokio::task::JoinHandle;
 use tokio::{task, time::sleep};
 mod _trait {
     use bytes::Bytes;

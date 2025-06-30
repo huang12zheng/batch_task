@@ -16,7 +16,7 @@
 ///     let (writer, handle) = BatchWriter::new(Box::new(processor), None, Some(max_batch_size), None);
 ///     writer.add_item(4);
 ///     writer.add_item(5);
-///     tokio::time::sleep(Duration::from_secs(5)).await;
+///     tokio::time::sleep(Duration::from_secs(1)).await;
 ///     if shutdown_flag {
 ///         writer.shutdown().await;
 ///         let _ = handle.await;
@@ -42,13 +42,10 @@ pub use _trait::*;
 // pub type BatchProcessor = impl Fn(Vec<impl IItem>) -> Pin<Box<dyn Future<Output = Result<()>>>>;
 pub type ProcessorOutput = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 // pub type BatchProcessor = impl Fn(Vec<Arc<dyn IItem>>) -> Pin<Box<dyn Future<Output = Result<()>>>>;
-// pub type BatchProcessor =
-//     impl Fn(Vec<Arc<dyn IItem>>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync;
 
 pub struct BatchWriter {
     item_sender: Sender<Box<dyn IItem>>,
     flush_sender: Sender<()>,
-    shutdown_tx: Sender<()>,
 }
 
 impl BatchWriter {
@@ -61,8 +58,6 @@ impl BatchWriter {
         // 创建跨线程通道
         let (item_sender, item_receiver) = channel(buffer_size.unwrap_or(1024));
         let (flush_sender, flush_receiver) = channel(1);
-        let (shutdown_tx, shutdown_rx) = channel(1);
-        // let shutdown_rx_t = shutdown_rx.clone();
 
         // 使用Arc共享批次处理器
         let batch_processor = Arc::new(processor);
@@ -74,7 +69,6 @@ impl BatchWriter {
                 BatchWriter::batch_processor_task(
                     item_receiver,
                     flush_receiver,
-                    shutdown_rx,
                     max_batch_size.unwrap_or(10),
                     batch_processor,
                 )
@@ -95,7 +89,6 @@ impl BatchWriter {
             Self {
                 item_sender,
                 flush_sender,
-                shutdown_tx,
             },
             handle,
         )
@@ -113,20 +106,15 @@ impl BatchWriter {
     }
 
     /// 手动触发刷新
-    pub async fn shutdown(&self) {
-        // drop(self.item_sender);
-        // let _ = self.flush_sender.send(()).await;
-        // let _ = self.shutdown_tx.try_send(());
-        let _ = self.shutdown_tx.send(()).await;
-
-        // handle.abort();
+    pub async fn shutdown(self) {
+        drop(self.item_sender);
+        drop(self.flush_sender);
     }
 
     /// 异步任务核心：处理数据并调用批次处理器
     async fn batch_processor_task(
         mut data_receiver: Receiver<Box<dyn IItem>>,
         mut flush_receiver: Receiver<()>,
-        mut shutdown_rx: Receiver<()>,
         max_batch_size: usize,
         batch_processor: Arc<
             impl Fn(Vec<Box<dyn IItem>>) -> ProcessorOutput + Sync + Send + 'static,
@@ -166,9 +154,6 @@ impl BatchWriter {
                         }
                     }
                 }
-                _ = shutdown_rx.recv() => {
-                    break
-                }
             }
         }
         dbg!(137);
@@ -187,24 +172,6 @@ impl IItem for u64 {
     }
 }
 
-// #[tokio::test]
-// async fn old_temp() -> Result<()> {
-//     // let processor: impl Fn(u64) = |item| {};
-//     // let processor: impl Fn(u64) -> impl Future<Output = Result<()>> = async |item| Ok(());
-//     // Box<(dyn Fn(Vec<Box<(dyn _trait::IItem + 'static)>>) -> Pin<Box<(dyn Future<Output = Result<(), anyhow::Error>> + Send + 'static)>> + Send + Sync + 'static)>
-//     let processor: impl Fn(Vec<Box<dyn IItem>>) -> ProcessorOutput =
-//         |_item| Box::pin(async { Ok(()) });
-
-//     // let processor: impl Fn(Vec<u64>) -> Pin<Box<dyn Future<Output = Result<()>>>> =
-//     //     |item| Box::pin(async { Ok(()) });
-//     // let processor = |item| async { Ok(()) };
-//     let _write = BatchWriter::new(Box::new(processor), None, None, None);
-//     let _a = processor(vec![Box::new(12u64)]).await?;
-
-//     // let processor: impl Future<Output = Result<()>> = async { Ok(()) };
-//     // let a = processor.await?;
-//     Ok(())
-// }
 #[tokio::test]
 async fn main_write2cycle() -> Result<()> {
     run(1, false).await
@@ -236,7 +203,7 @@ async fn run(max_batch_size: usize, shutdown_flag: bool) -> Result<()> {
     let (writer, handle) = BatchWriter::new(Box::new(processor), None, Some(max_batch_size), None);
     writer.add_item(4);
     writer.add_item(5);
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     if shutdown_flag {
         writer.shutdown().await;
         let _ = handle.await;

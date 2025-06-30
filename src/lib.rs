@@ -1,41 +1,20 @@
 #![feature(impl_trait_in_bindings)]
 #![feature(type_alias_impl_trait)]
 
-/// #[cfg(test)]
-/// async fn run(max_batch_size: usize, shutdown_flag: bool) -> Result<()> {
-///     let processor: impl Fn(Vec<Box<dyn IItem>>) -> ProcessorOutput = |item| {
-///         Box::pin(async move {
-///             dbg!(item.len());
-///             for e in item {
-///                 dbg!(&e.encode());
-///             }
-///             Ok(())
-///         })
-///     };
-///
-///     let (writer, handle) = BatchWriter::new(Box::new(processor), None, Some(max_batch_size), None);
-///     writer.add_item(4);
-///     writer.add_item(5);
-///     tokio::time::sleep(Duration::from_secs(1)).await;
-///     if shutdown_flag {
-///         writer.shutdown().await;
-///         let _ = handle.await;
-///     }
-///     Ok(())
-/// }
+#[cfg(test)]
+use std::sync::Mutex;
+
 pub use std::{pin::Pin, sync::Arc, time::Duration};
 
 pub use anyhow::{Ok, Result};
-pub use bytes::Bytes;
 use tokio::sync::mpsc::channel;
 pub use tokio::sync::mpsc::{Receiver, Sender};
 pub use tokio::task::JoinHandle;
 use tokio::{task, time::sleep};
 mod _trait {
-    use bytes::Bytes;
-
-    pub trait IItem: Send + Sync {
-        fn encode(&self) -> Bytes;
+    pub trait Callback: Send + Sync {
+        type Item: Send + 'static;
+        fn callback(&self) -> anyhow::Result<()>;
     }
 }
 pub use _trait::*;
@@ -44,14 +23,14 @@ pub use _trait::*;
 pub type ProcessorOutput = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 // pub type BatchProcessor = impl Fn(Vec<Arc<dyn IItem>>) -> Pin<Box<dyn Future<Output = Result<()>>>>;
 
-pub struct BatchWriter {
-    item_sender: Sender<Box<dyn IItem>>,
+pub struct BatchWriter<T: Callback> {
+    item_sender: Sender<T::Item>,
     flush_sender: Sender<()>,
 }
 
-impl BatchWriter {
+impl<T: Callback> BatchWriter<T> {
     pub fn new(
-        processor: impl Fn(Vec<Box<dyn IItem>>) -> ProcessorOutput + Sync + Send + 'static,
+        processor: impl Fn(Vec<T::Item>) -> ProcessorOutput + Sync + Send + 'static,
         interval: Option<Duration>,
         max_batch_size: Option<usize>,
         buffer_size: Option<usize>,
@@ -67,7 +46,7 @@ impl BatchWriter {
         let handle: JoinHandle<()> = tokio::spawn({
             let batch_processor = batch_processor.clone();
             async move {
-                BatchWriter::batch_processor_task(
+                Self::batch_processor_task(
                     item_receiver,
                     flush_receiver,
                     max_batch_size.unwrap_or(10),
@@ -96,9 +75,9 @@ impl BatchWriter {
     }
 
     /// 添加数据对象到批处理队列
-    pub fn add_item(&self, item: impl IItem + 'static) {
+    pub fn add_item(&self, item: T::Item) {
         // 非阻塞发送，如果队列满则丢弃数据（可根据需求调整策略）
-        let _ = self.item_sender.try_send(Box::new(item));
+        let _ = self.item_sender.try_send(item);
     }
 
     pub async fn flush(&self) {
@@ -114,12 +93,10 @@ impl BatchWriter {
 
     /// 异步任务核心：处理数据并调用批次处理器
     async fn batch_processor_task(
-        mut data_receiver: Receiver<Box<dyn IItem>>,
+        mut data_receiver: Receiver<T::Item>,
         mut flush_receiver: Receiver<()>,
         max_batch_size: usize,
-        batch_processor: Arc<
-            impl Fn(Vec<Box<dyn IItem>>) -> ProcessorOutput + Sync + Send + 'static,
-        >,
+        batch_processor: Arc<impl Fn(Vec<T::Item>) -> ProcessorOutput + Sync + Send + 'static>,
     ) {
         let mut buffer = Vec::with_capacity(max_batch_size);
         dbg!(107);
@@ -129,7 +106,6 @@ impl BatchWriter {
                 item = data_receiver.recv() => {
                     match item {
                         Some(item) => {
-                            dbg!(114);
                             buffer.push(item);
 
                             // 达到批量大小时立即处理
@@ -141,7 +117,6 @@ impl BatchWriter {
                             }
                         }
                         None => {
-                            dbg!(125);
                             break
                         }, // 通道关闭时退出
                     }
@@ -167,41 +142,80 @@ impl BatchWriter {
         }
     }
 }
-impl IItem for u64 {
-    fn encode(&self) -> Bytes {
-        Bytes::from(self.to_string())
+#[cfg(test)]
+impl Callback for Vec<u64> {
+    type Item = u64;
+    fn callback(&self) -> Result<()> {
+        let mut v = RESULT.lock().unwrap();
+        v.push(self.len().to_string());
+
+        for e in self {
+            v.push(e.to_string())
+        }
+        Ok(())
     }
 }
 
 #[tokio::test]
-async fn main_write2cycle() -> Result<()> {
-    run(1, false).await
+async fn main_write2cycle() {
+    run(1, false).await.unwrap();
+    let mut v = RESULT.lock().unwrap();
+    insta::assert_debug_snapshot!(v,@r#"
+    [
+        "1",
+        "4",
+        "1",
+        "5",
+    ]
+    "#);
+    v.clear();
 }
 #[tokio::test]
-async fn main_nowrite() -> Result<()> {
-    run(3, false).await
+async fn main_nowrite() {
+    run(3, false).await.unwrap();
+    let mut v = RESULT.lock().unwrap();
+    insta::assert_debug_snapshot!(v,@"[]");
+    v.clear();
 }
 #[tokio::test]
-async fn main_shutdown() -> Result<()> {
-    run(3, true).await
+async fn main_shutdown() {
+    run(3, true).await.unwrap();
+    let mut v = RESULT.lock().unwrap();
+    insta::assert_debug_snapshot!(v,@r#"
+    [
+        "2",
+        "4",
+        "5",
+    ]
+    "#);
+    v.clear();
 }
 #[tokio::test]
-async fn main_write2() -> Result<()> {
-    run(2, false).await
+async fn main_write2() {
+    run(2, false).await.unwrap();
+    let mut v = RESULT.lock().unwrap();
+    insta::assert_debug_snapshot!(v,@r#"
+    [
+        "2",
+        "4",
+        "5",
+    ]
+    "#);
+    v.clear();
 }
 #[cfg(test)]
+pub static RESULT: std::sync::Mutex<Vec<String>> = Mutex::new(vec![]);
+#[cfg(test)]
 async fn run(max_batch_size: usize, shutdown_flag: bool) -> Result<()> {
-    let processor: impl Fn(Vec<Box<dyn IItem>>) -> ProcessorOutput = |item| {
+    let processor: impl Fn(Vec<u64>) -> ProcessorOutput = |item| {
         Box::pin(async move {
-            dbg!(item.len());
-            for e in item {
-                dbg!(&e.encode());
-            }
+            let _ = item.callback()?;
             Ok(())
         })
     };
 
-    let (writer, handle) = BatchWriter::new(Box::new(processor), None, Some(max_batch_size), None);
+    let (writer, handle) =
+        BatchWriter::<Vec<u64>>::new(Box::new(processor), None, Some(max_batch_size), None);
     writer.add_item(4);
     writer.add_item(5);
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -209,5 +223,6 @@ async fn run(max_batch_size: usize, shutdown_flag: bool) -> Result<()> {
         writer.shutdown().await;
         let _ = handle.await;
     }
+
     Ok(())
 }

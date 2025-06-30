@@ -8,3 +8,5 @@ edition = "2024"
 tokio = { version = "1.45.1", features = ["macros", "rt", "sync", "time"] }
 bytes = { version = "1", default-features = false }
 anyhow = "1.0.98"
+[dev-dependencies]
+insta = "*"

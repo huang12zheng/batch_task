@@ -1,5 +1,4 @@
 #![feature(impl_trait_in_bindings)]
-#![feature(type_alias_impl_trait)]
 
 #[cfg(test)]
 use std::sync::Mutex;
@@ -19,9 +18,7 @@ mod _trait {
 }
 pub use _trait::*;
 
-// pub type BatchProcessor = impl Fn(Vec<impl IItem>) -> Pin<Box<dyn Future<Output = Result<()>>>>;
 pub type ProcessorOutput = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-// pub type BatchProcessor = impl Fn(Vec<Arc<dyn IItem>>) -> Pin<Box<dyn Future<Output = Result<()>>>>;
 
 pub struct BatchWriter<T: Callback> {
     item_sender: Sender<T::Item>,
@@ -45,23 +42,17 @@ impl<T: Callback> BatchWriter<T> {
         // 启动Tokio异步写入任务
         let handle: JoinHandle<()> = tokio::spawn({
             let batch_processor = batch_processor.clone();
+            let flush_sender_ = flush_sender.clone();
             async move {
                 Self::batch_processor_task(
                     item_receiver,
+                    flush_sender_,
                     flush_receiver,
                     max_batch_size.unwrap_or(10),
+                    interval.unwrap_or(Duration::from_secs(30)),
                     batch_processor,
                 )
                 .await;
-            }
-        });
-
-        // 启动定时刷新任务
-        let interval_sender = flush_sender.clone();
-        tokio::spawn(async move {
-            loop {
-                sleep(interval.unwrap_or(Duration::from_secs(30))).await;
-                let _ = interval_sender.send(());
             }
         });
 
@@ -94,14 +85,15 @@ impl<T: Callback> BatchWriter<T> {
     /// 异步任务核心：处理数据并调用批次处理器
     async fn batch_processor_task(
         mut data_receiver: Receiver<T::Item>,
+        flush_sender: Sender<()>,
         mut flush_receiver: Receiver<()>,
         max_batch_size: usize,
+        interval: Duration,
         batch_processor: Arc<impl Fn(Vec<T::Item>) -> ProcessorOutput + Sync + Send + 'static>,
     ) {
         let mut buffer = Vec::with_capacity(max_batch_size);
-        dbg!(107);
+        let mut delay = interval.clone();
         loop {
-            // 使用crossbeam的select!同时等待数据和刷新信号
             tokio::select! {
                 item = data_receiver.recv() => {
                     match item {
@@ -115,12 +107,16 @@ impl<T: Callback> BatchWriter<T> {
                                     eprintln!("Batch processing error: {}", e);
                                 }
                             }
+                            delay = interval
                         }
                         None => {
                             break
                         }, // 通道关闭时退出
                     }
                 },
+                _ = sleep(delay) => {
+                    let _ = flush_sender.send(());
+                }
                 _ = flush_receiver.recv() => {
                     dbg!(buffer.len());
                     if !buffer.is_empty() {
@@ -128,6 +124,8 @@ impl<T: Callback> BatchWriter<T> {
                         if let Err(e) = (*batch_processor)(batch).await {
                             eprintln!("Flush processing error: {}", e);
                         }
+                    } else {
+                        delay *= 2
                     }
                 }
             }

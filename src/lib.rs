@@ -13,7 +13,7 @@ use tokio::{task, time::sleep};
 mod _trait {
     pub trait Callback: Send + Sync {
         type Item: Send + 'static;
-        fn callback(&self) -> anyhow::Result<()>;
+        fn callback(&self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
     }
 }
 pub use _trait::*;
@@ -145,7 +145,7 @@ impl<T: Callback> BatchWriter<T> {
 #[cfg(test)]
 impl Callback for Vec<u64> {
     type Item = u64;
-    fn callback(&self) -> Result<()> {
+    async fn callback(&self) -> Result<()> {
         let mut v = RESULT.lock().unwrap();
         v.push(self.len().to_string());
 
@@ -209,7 +209,7 @@ pub static RESULT: std::sync::Mutex<Vec<String>> = Mutex::new(vec![]);
 async fn run(max_batch_size: usize, shutdown_flag: bool) -> Result<()> {
     let processor: impl Fn(Vec<u64>) -> ProcessorOutput = |item| {
         Box::pin(async move {
-            let _ = item.callback()?;
+            let _ = item.callback().await?;
             Ok(())
         })
     };

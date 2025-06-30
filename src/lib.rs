@@ -17,6 +17,8 @@ mod _trait {
     }
 }
 pub use _trait::*;
+mod join_handle;
+pub use join_handle::*;
 
 pub type ProcessorOutput = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 

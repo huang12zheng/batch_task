@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 # crossbeam = "0.8.4"
 tokio = { version = "1.45.1", features = ["macros", "rt", "sync", "time"] }
-bytes = { version = "1", default-features = false }
+# bytes = { version = "1", default-features = false }
 anyhow = "1.0.98"
+futures = { version = "0.3.31", features = ["alloc"], default-features = false }
 [dev-dependencies]
 insta = "*"

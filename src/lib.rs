@@ -1,5 +1,4 @@
 #![feature(impl_trait_in_bindings)]
-
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -12,28 +11,28 @@ pub use tokio::task::JoinHandle;
 use tokio::{task, time::sleep};
 mod _trait {
     pub trait Callback: Send + Sync {
-        type Item: Send + 'static;
-        fn callback(&self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+        type Item: Send;
+        fn callback(self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+        fn inner(&self) -> &[Self::Item];
+        fn outer(value: Vec<Self::Item>) -> Self;
     }
 }
 pub use _trait::*;
 mod join_handle;
 pub use join_handle::*;
 
-pub type ProcessorOutput = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-
 pub struct BatchWriter<T: Callback> {
     item_sender: Sender<T::Item>,
     flush_sender: Sender<()>,
 }
 
-impl<T: Callback> BatchWriter<T> {
+impl<T: Callback + 'static> BatchWriter<T> {
     pub fn new(
-        processor: impl Fn(Vec<T::Item>) -> ProcessorOutput + Sync + Send + 'static,
         interval: Option<Duration>,
         max_batch_size: Option<usize>,
         buffer_size: Option<usize>,
     ) -> (Self, task::JoinHandle<()>) {
+        let processor = T::callback;
         // 创建跨线程通道
         let (item_sender, item_receiver) = channel(buffer_size.unwrap_or(1024));
         let (flush_sender, flush_receiver) = channel(1);
@@ -85,14 +84,17 @@ impl<T: Callback> BatchWriter<T> {
     }
 
     /// 异步任务核心：处理数据并调用批次处理器
-    async fn batch_processor_task(
+    async fn batch_processor_task<S, Fut>(
         mut data_receiver: Receiver<T::Item>,
         flush_sender: Sender<()>,
         mut flush_receiver: Receiver<()>,
         max_batch_size: usize,
         interval: Duration,
-        batch_processor: Arc<impl Fn(Vec<T::Item>) -> ProcessorOutput + Sync + Send + 'static>,
-    ) {
+        batch_processor: Arc<S>,
+    ) where
+        S: Fn(T) -> Fut,
+        Fut: Future<Output = Result<()>> + Send,
+    {
         let mut buffer = Vec::with_capacity(max_batch_size);
         let mut delay = interval.clone();
         loop {
@@ -105,7 +107,7 @@ impl<T: Callback> BatchWriter<T> {
                             // 达到批量大小时立即处理
                             if buffer.len() >= max_batch_size {
                                 let batch = std::mem::replace(&mut buffer, Vec::with_capacity(max_batch_size));
-                                if let Err(e) = (*batch_processor)(batch).await {
+                                if let Err(e) = (*batch_processor)(T::outer(batch)).await {
                                     eprintln!("Batch processing error: {}", e);
                                 }
                             }
@@ -123,7 +125,7 @@ impl<T: Callback> BatchWriter<T> {
                     dbg!(buffer.len());
                     if !buffer.is_empty() {
                         let batch = std::mem::replace(&mut buffer, Vec::with_capacity(max_batch_size));
-                        if let Err(e) = (*batch_processor)(batch).await {
+                        if let Err(e) = (*batch_processor)(T::outer(batch)).await {
                             eprintln!("Flush processing error: {}", e);
                         }
                     } else {
@@ -136,23 +138,33 @@ impl<T: Callback> BatchWriter<T> {
         // 退出时处理剩余数据
         if !buffer.is_empty() {
             let batch = std::mem::replace(&mut buffer, Vec::new());
-            if let Err(e) = (*batch_processor)(batch).await {
+            if let Err(e) = (*batch_processor)(T::outer(batch)).await {
                 eprintln!("Final batch processing error: {}", e);
             }
         }
     }
 }
 #[cfg(test)]
-impl Callback for Vec<u64> {
+pub struct U64List(Vec<u64>);
+#[cfg(test)]
+impl Callback for U64List {
     type Item = u64;
-    async fn callback(&self) -> Result<()> {
+    async fn callback(self) -> Result<()> {
         let mut v = RESULT.lock().unwrap();
-        v.push(self.len().to_string());
+        v.push(self.inner().len().to_string());
 
-        for e in self {
+        for e in self.inner() {
             v.push(e.to_string())
         }
         Ok(())
+    }
+
+    fn inner(&self) -> &[Self::Item] {
+        &self.0
+    }
+
+    fn outer(value: Vec<Self::Item>) -> Self {
+        Self(value)
     }
 }
 
@@ -207,15 +219,7 @@ async fn main_write2() {
 pub static RESULT: std::sync::Mutex<Vec<String>> = Mutex::new(vec![]);
 #[cfg(test)]
 async fn run(max_batch_size: usize, shutdown_flag: bool) -> Result<()> {
-    let processor: impl Fn(Vec<u64>) -> ProcessorOutput = |item| {
-        Box::pin(async move {
-            let _ = item.callback().await?;
-            Ok(())
-        })
-    };
-
-    let (writer, handle) =
-        BatchWriter::<Vec<u64>>::new(Box::new(processor), None, Some(max_batch_size), None);
+    let (writer, handle) = BatchWriter::<U64List>::new(None, Some(max_batch_size), None);
     writer.add_item(4);
     writer.add_item(5);
     tokio::time::sleep(Duration::from_secs(1)).await;

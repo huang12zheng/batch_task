@@ -15,11 +15,13 @@ mod _trait {
         fn callback(self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
         fn inner(&self) -> &[Self::Item];
         fn outer(value: Vec<Self::Item>) -> Self;
+        fn id() -> u128;
     }
 }
 pub use _trait::*;
 mod join_handle;
 pub use join_handle::*;
+mod cache;
 
 pub struct BatchWriter<T: Callback> {
     item_sender: Sender<T::Item>,
@@ -65,9 +67,9 @@ impl<T: Callback + 'static> BatchWriter<T> {
             handle,
         )
     }
-    pub fn none() -> (Self, task::JoinHandle<()>) {
-        Self::new(None, None, None)
-    }
+    // pub fn none() -> (Self, task::JoinHandle<()>) {
+    //     Self::new(None, None, None)
+    // }
     /// 添加数据对象到批处理队列
     pub fn add_item(&self, item: T::Item) {
         // 非阻塞发送，如果队列满则丢弃数据（可根据需求调整策略）
@@ -167,6 +169,9 @@ impl Callback for U64List {
 
     fn outer(value: Vec<Self::Item>) -> Self {
         Self(value)
+    }
+    fn id() -> u128 {
+        0
     }
 }
 

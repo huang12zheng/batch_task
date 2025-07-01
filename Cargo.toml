@@ -9,5 +9,6 @@ tokio = { version = "1.45.1", features = ["macros", "rt", "sync", "time"] }
 # bytes = { version = "1", default-features = false }
 anyhow = "1.0.98"
 futures = { version = "0.3.31", features = ["alloc"], default-features = false }
+dashmap = "6.1.0"
 [dev-dependencies]
 insta = "*"

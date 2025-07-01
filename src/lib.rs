@@ -65,7 +65,9 @@ impl<T: Callback + 'static> BatchWriter<T> {
             handle,
         )
     }
-
+    pub fn none() -> (Self, task::JoinHandle<()>) {
+        Self::new(None, None, None)
+    }
     /// 添加数据对象到批处理队列
     pub fn add_item(&self, item: T::Item) {
         // 非阻塞发送，如果队列满则丢弃数据（可根据需求调整策略）

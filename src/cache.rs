@@ -39,7 +39,7 @@ impl BatchWriterCache {
 
         let shutdown_rx = self.shutdown_tx.subscribe(); // 创建订阅
         // 创建新实例
-        let (writer, handle) = BatchWriter::<T>::new(None, None, None, shutdown_rx);
+        let (writer, handle) = BatchWriter::<T>::new(None, None, None, Some(shutdown_rx));
         add2pool(handle);
         let writer_arc = Arc::new(writer);
         let weak_ref = Arc::downgrade(&writer_arc);

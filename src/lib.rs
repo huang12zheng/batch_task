@@ -15,13 +15,13 @@ mod _trait {
         fn callback(self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
         fn inner(&self) -> &[Self::Item];
         fn outer(value: Vec<Self::Item>) -> Self;
-        fn id() -> u128;
     }
 }
 pub use _trait::*;
 mod join_handle;
 pub use join_handle::*;
 mod cache;
+pub use cache::shutdown_all;
 
 pub struct BatchWriter<T: Callback> {
     item_sender: Sender<T::Item>,
@@ -33,6 +33,7 @@ impl<T: Callback + 'static> BatchWriter<T> {
         interval: Option<Duration>,
         max_batch_size: Option<usize>,
         buffer_size: Option<usize>,
+        shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> (Self, task::JoinHandle<()>) {
         let processor = T::callback;
         // 创建跨线程通道
@@ -51,6 +52,7 @@ impl<T: Callback + 'static> BatchWriter<T> {
                     item_receiver,
                     flush_sender_,
                     flush_receiver,
+                    shutdown_rx,
                     max_batch_size.unwrap_or(10),
                     interval.unwrap_or(Duration::from_secs(30)),
                     batch_processor,
@@ -67,9 +69,7 @@ impl<T: Callback + 'static> BatchWriter<T> {
             handle,
         )
     }
-    // pub fn none() -> (Self, task::JoinHandle<()>) {
-    //     Self::new(None, None, None)
-    // }
+
     /// 添加数据对象到批处理队列
     pub fn add_item(&self, item: T::Item) {
         // 非阻塞发送，如果队列满则丢弃数据（可根据需求调整策略）
@@ -92,6 +92,7 @@ impl<T: Callback + 'static> BatchWriter<T> {
         mut data_receiver: Receiver<T::Item>,
         flush_sender: Sender<()>,
         mut flush_receiver: Receiver<()>,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         max_batch_size: usize,
         interval: Duration,
         batch_processor: Arc<S>,
@@ -126,7 +127,6 @@ impl<T: Callback + 'static> BatchWriter<T> {
                     let _ = flush_sender.send(());
                 }
                 _ = flush_receiver.recv() => {
-                    dbg!(buffer.len());
                     if !buffer.is_empty() {
                         let batch = std::mem::replace(&mut buffer, Vec::with_capacity(max_batch_size));
                         if let Err(e) = (*batch_processor)(T::outer(batch)).await {
@@ -136,9 +136,12 @@ impl<T: Callback + 'static> BatchWriter<T> {
                         delay *= 2
                     }
                 }
+                _ = shutdown_rx.recv() => {
+                    break
+                }
             }
         }
-        dbg!(137);
+
         // 退出时处理剩余数据
         if !buffer.is_empty() {
             let batch = std::mem::replace(&mut buffer, Vec::new());
@@ -169,9 +172,6 @@ impl Callback for U64List {
 
     fn outer(value: Vec<Self::Item>) -> Self {
         Self(value)
-    }
-    fn id() -> u128 {
-        0
     }
 }
 
@@ -226,7 +226,9 @@ async fn main_write2() {
 pub static RESULT: std::sync::Mutex<Vec<String>> = Mutex::new(vec![]);
 #[cfg(test)]
 async fn run(max_batch_size: usize, shutdown_flag: bool) -> Result<()> {
-    let (writer, handle) = BatchWriter::<U64List>::new(None, Some(max_batch_size), None);
+    let (_, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let (writer, handle) =
+        BatchWriter::<U64List>::new(None, Some(max_batch_size), None, shutdown_rx);
     writer.add_item(4);
     writer.add_item(5);
     tokio::time::sleep(Duration::from_secs(1)).await;

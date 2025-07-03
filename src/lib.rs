@@ -5,13 +5,15 @@ use std::sync::Mutex;
 pub use std::{pin::Pin, sync::Arc, time::Duration};
 
 pub use anyhow::{Ok, Result};
+
 use tokio::sync::mpsc::channel;
 pub use tokio::sync::mpsc::{Receiver, Sender};
 pub use tokio::task::JoinHandle;
 use tokio::{task, time::sleep};
 mod _trait {
+    use std::fmt::Debug;
     pub trait Callback: Send + Sync {
-        type Item: Send;
+        type Item: Send + Debug;
         fn callback(self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
         fn inner(&self) -> &[Self::Item];
         fn outer(value: Vec<Self::Item>) -> Self;
@@ -23,9 +25,13 @@ pub use join_handle::*;
 mod cache;
 pub use cache::shutdown_all;
 
+struct FlushRequest {
+    resp: tokio::sync::oneshot::Sender<()>,
+}
+
 pub struct BatchWriter<T: Callback> {
     item_sender: Sender<T::Item>,
-    flush_sender: Sender<()>,
+    flush_sender: Sender<FlushRequest>,
 }
 
 impl<T: Callback + 'static> BatchWriter<T> {
@@ -35,38 +41,29 @@ impl<T: Callback + 'static> BatchWriter<T> {
         buffer_size: Option<usize>,
         shutdown_rx: Option<tokio::sync::broadcast::Receiver<()>>,
     ) -> (Self, task::JoinHandle<()>) {
-        let processor = T::callback;
         // 创建跨线程通道
         let (item_sender, item_receiver) = channel(buffer_size.unwrap_or(1024));
         let (flush_sender, flush_receiver) = channel(1);
 
-        // 使用Arc共享批次处理器
-        let batch_processor = Arc::new(processor);
-
         // 启动Tokio异步写入任务
         let handle: JoinHandle<()> = tokio::spawn({
-            let batch_processor = batch_processor.clone();
             let flush_sender_ = flush_sender.clone();
             async move {
                 if let Some(shutdown_rx) = shutdown_rx {
                     Self::batch_processor_task(
                         item_receiver,
-                        flush_sender_,
                         flush_receiver,
                         shutdown_rx,
                         max_batch_size.unwrap_or(10),
                         interval.unwrap_or(Duration::from_secs(30)),
-                        batch_processor,
                     )
                     .await;
                 } else {
                     Self::batch_processor_task_base(
                         item_receiver,
-                        flush_sender_,
                         flush_receiver,
                         max_batch_size.unwrap_or(10),
                         interval.unwrap_or(Duration::from_secs(30)),
-                        batch_processor,
                     )
                     .await;
                 }
@@ -89,8 +86,10 @@ impl<T: Callback + 'static> BatchWriter<T> {
     }
 
     pub async fn flush(&self) {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         // 发送刷新信号（翻转布尔值）
-        let _ = self.flush_sender.send(()).await;
+        let _ = self.flush_sender.send(FlushRequest { resp: resp_tx }).await;
+        let _ = resp_rx.await;
     }
 
     /// 手动触发刷新
@@ -100,18 +99,13 @@ impl<T: Callback + 'static> BatchWriter<T> {
     }
 
     /// 异步任务核心：处理数据并调用批次处理器
-    async fn batch_processor_task<S, Fut>(
+    async fn batch_processor_task(
         mut data_receiver: Receiver<T::Item>,
-        flush_sender: Sender<()>,
-        mut flush_receiver: Receiver<()>,
+        mut flush_receiver: Receiver<FlushRequest>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         max_batch_size: usize,
         interval: Duration,
-        batch_processor: Arc<S>,
-    ) where
-        S: Fn(T) -> Fut,
-        Fut: Future<Output = Result<()>> + Send,
-    {
+    ) {
         let mut buffer = Vec::with_capacity(max_batch_size);
         let mut delay = interval.clone();
         loop {
@@ -124,7 +118,7 @@ impl<T: Callback + 'static> BatchWriter<T> {
                             // 达到批量大小时立即处理
                             if buffer.len() >= max_batch_size {
                                 let batch = std::mem::replace(&mut buffer, Vec::with_capacity(max_batch_size));
-                                if let Err(e) = (*batch_processor)(T::outer(batch)).await {
+                                if let Err(e) = (T::callback)(T::outer(batch)).await {
                                     eprintln!("Batch processing error: {}", e);
                                 }
                             }
@@ -136,17 +130,29 @@ impl<T: Callback + 'static> BatchWriter<T> {
                     }
                 },
                 _ = sleep(delay) => {
-                    let _ = flush_sender.send(());
-                }
-                _ = flush_receiver.recv() => {
                     if !buffer.is_empty() {
                         let batch = std::mem::replace(&mut buffer, Vec::with_capacity(max_batch_size));
-                        if let Err(e) = (*batch_processor)(T::outer(batch)).await {
+                        if let Err(e) = (T::callback)(T::outer(batch)).await {
                             eprintln!("Flush processing error: {}", e);
                         }
                     } else {
                         delay *= 2
                     }
+                }
+                flush_req = flush_receiver.recv() => {
+                    if let Some(resp) = flush_req {
+                        if !buffer.is_empty() {
+                            let batch = std::mem::replace(&mut buffer, Vec::with_capacity(max_batch_size));
+                            if let Err(e) = (T::callback)(T::outer(batch)).await {
+                                eprintln!("Flush processing error: {}", e);
+                            }
+                        }
+                        let _ = resp.resp.send(());
+                    }
+                    else {
+                        break;
+                    }
+
                 }
                 _ = shutdown_rx.recv() => {
                     break
@@ -157,22 +163,17 @@ impl<T: Callback + 'static> BatchWriter<T> {
         // 退出时处理剩余数据
         if !buffer.is_empty() {
             let batch = std::mem::replace(&mut buffer, Vec::new());
-            if let Err(e) = (*batch_processor)(T::outer(batch)).await {
+            if let Err(e) = (T::callback)(T::outer(batch)).await {
                 eprintln!("Final batch processing error: {}", e);
             }
         }
     }
-    async fn batch_processor_task_base<S, Fut>(
+    async fn batch_processor_task_base(
         mut data_receiver: Receiver<T::Item>,
-        flush_sender: Sender<()>,
-        mut flush_receiver: Receiver<()>,
+        mut flush_receiver: Receiver<FlushRequest>,
         max_batch_size: usize,
         interval: Duration,
-        batch_processor: Arc<S>,
-    ) where
-        S: Fn(T) -> Fut,
-        Fut: Future<Output = Result<()>> + Send,
-    {
+    ) {
         let mut buffer = Vec::with_capacity(max_batch_size);
         let mut delay = interval.clone();
         loop {
@@ -185,11 +186,13 @@ impl<T: Callback + 'static> BatchWriter<T> {
                             // 达到批量大小时立即处理
                             if buffer.len() >= max_batch_size {
                                 let batch = std::mem::replace(&mut buffer, Vec::with_capacity(max_batch_size));
-                                if let Err(e) = (*batch_processor)(T::outer(batch)).await {
+                                if let Err(e) = (T::callback)(T::outer(batch)).await {
                                     eprintln!("Batch processing error: {}", e);
                                 }
                             }
-                            delay = interval
+
+                            dbg!(std::time::SystemTime::now());
+                            delay = interval;
                         }
                         None => {
                             break
@@ -197,16 +200,27 @@ impl<T: Callback + 'static> BatchWriter<T> {
                     }
                 },
                 _ = sleep(delay) => {
-                    let _ = flush_sender.send(());
-                }
-                _ = flush_receiver.recv() => {
                     if !buffer.is_empty() {
                         let batch = std::mem::replace(&mut buffer, Vec::with_capacity(max_batch_size));
-                        if let Err(e) = (*batch_processor)(T::outer(batch)).await {
+                        if let Err(e) = (T::callback)(T::outer(batch)).await {
                             eprintln!("Flush processing error: {}", e);
                         }
                     } else {
                         delay *= 2
+                    }
+                }
+                flush_req = flush_receiver.recv() => {
+                    if let Some(resp) = flush_req {
+                        if !buffer.is_empty() {
+                            let batch = std::mem::replace(&mut buffer, Vec::with_capacity(max_batch_size));
+                            if let Err(e) = (T::callback)(T::outer(batch)).await {
+                                eprintln!("Flush processing error: {}", e);
+                            }
+                        }
+                        let _ = resp.resp.send(());
+                    }
+                    else {
+                        break;
                     }
                 }
             }
@@ -215,7 +229,7 @@ impl<T: Callback + 'static> BatchWriter<T> {
         // 退出时处理剩余数据
         if !buffer.is_empty() {
             let batch = std::mem::replace(&mut buffer, Vec::new());
-            if let Err(e) = (*batch_processor)(T::outer(batch)).await {
+            if let Err(e) = (T::callback)(T::outer(batch)).await {
                 eprintln!("Final batch processing error: {}", e);
             }
         }

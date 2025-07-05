@@ -47,7 +47,6 @@ impl<T: Callback + 'static> BatchWriter<T> {
 
         // 启动Tokio异步写入任务
         let handle: JoinHandle<()> = tokio::spawn({
-            let flush_sender_ = flush_sender.clone();
             async move {
                 if let Some(shutdown_rx) = shutdown_rx {
                     Self::batch_processor_task(
